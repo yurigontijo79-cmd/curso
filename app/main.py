@@ -112,6 +112,41 @@ def init_db() -> None:
                 updated_at TEXT,
                 dismissed_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS curriculum_import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT,
+                source_name TEXT,
+                source_hash TEXT,
+                imported_by_user_id INTEGER,
+                status TEXT,
+                payload_json TEXT,
+                preview_json TEXT,
+                validation_report_json TEXT,
+                applied_at TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS curriculum_import_issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_batch_id INTEGER,
+                issue_type TEXT,
+                severity TEXT,
+                target_kind TEXT,
+                target_ref TEXT,
+                message TEXT,
+                details_json TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS curriculum_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                import_batch_id INTEGER,
+                collection_id INTEGER,
+                version_label TEXT,
+                checksum TEXT,
+                applied_by_user_id INTEGER,
+                created_at TEXT
+            );
             """
         )
 
@@ -746,3 +781,229 @@ def ui_admin():
         rows = conn.execute("SELECT id,version,review_state,is_current,origin,generator_provider,generator_model FROM generated_pieces ORDER BY id DESC LIMIT 10").fetchall()
     items = ''.join([f"<li>#{r['id']} v{r['version']} {r['review_state']} current={r['is_current']} {r['origin']} ({r['generator_provider']}/{r['generator_model']})</li>" for r in rows])
     return shell('Painel Administrativo', f"<div class='card'><ul>{items}</ul></div>")
+
+
+class CurriculumImportBatchIn(BaseModel):
+    source_type: str = "payload"
+    source_name: str
+    imported_by_user_id: int
+    payload: dict[str, Any]
+
+
+def normalize_curriculum_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    def clean(v):
+        if isinstance(v, str):
+            return " ".join(v.strip().split())
+        if isinstance(v, list):
+            return [clean(x) for x in v]
+        if isinstance(v, dict):
+            return {k: clean(v[k]) for k in sorted(v.keys())}
+        return v
+
+    data = clean(payload)
+    for key in ["tracks", "volumes", "chapters", "syllabi"]:
+        if key in data and isinstance(data[key], list):
+            data[key] = sorted(data[key], key=lambda x: (str(x.get("code", "")), int(x.get("canonical_order", 0))))
+    return data
+
+
+def payload_checksum(payload: dict[str, Any]) -> str:
+    normalized = normalize_curriculum_payload(payload)
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def validate_curriculum(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    issues = []
+    p = normalize_curriculum_payload(payload)
+
+    required = ["collection", "tracks", "volumes", "chapters", "syllabi"]
+    for r in required:
+        if r not in p:
+            issues.append({"issue_type": "missing_required_field", "severity": "error", "target_kind": "payload", "target_ref": r, "message": f"Campo obrigatório ausente: {r}", "details_json": {}})
+
+    tracks = p.get("tracks", [])
+    volumes = p.get("volumes", [])
+    chapters = p.get("chapters", [])
+    syllabi = p.get("syllabi", [])
+
+    def dup(items, key, kind):
+        seen = set()
+        for i in items:
+            v = i.get(key)
+            if v in seen:
+                issues.append({"issue_type": f"duplicate_{key}", "severity": "error", "target_kind": kind, "target_ref": str(v), "message": f"{key} duplicado", "details_json": i})
+            else:
+                seen.add(v)
+
+    dup(tracks, "code", "track")
+    dup(volumes, "code", "volume")
+    dup(chapters, "code", "chapter")
+
+    # duplicate order per parent
+    by_track = {}
+    for v in volumes:
+        by_track.setdefault(v.get("track_code"), set())
+        if v.get("canonical_order") in by_track[v.get("track_code")]:
+            issues.append({"issue_type": "duplicate_order", "severity": "error", "target_kind": "volume", "target_ref": v.get("code"), "message": "canonical_order duplicado", "details_json": v})
+        by_track[v.get("track_code")].add(v.get("canonical_order"))
+
+    vol_codes = {v.get("code") for v in volumes}
+    for c in chapters:
+        if c.get("volume_code") not in vol_codes:
+            issues.append({"issue_type": "orphan_chapter", "severity": "error", "target_kind": "chapter", "target_ref": c.get("code"), "message": "chapter sem volume válido", "details_json": c})
+
+    allowed_status = {"active", "authorized", "archived"}
+    for item, kind in [(tracks, "track"), (volumes, "volume"), (chapters, "chapter"), (syllabi, "syllabus")]:
+        for it in item:
+            if it.get("status") and it.get("status") not in allowed_status:
+                issues.append({"issue_type": "invalid_status", "severity": "error", "target_kind": kind, "target_ref": it.get("code", "-"), "message": "status inválido", "details_json": it})
+
+    for s in syllabi:
+        if not s.get("program_content"):
+            issues.append({"issue_type": "empty_program_content", "severity": "error", "target_kind": "syllabus", "target_ref": str(s.get("chapter_code")), "message": "conteúdo programático vazio", "details_json": s})
+
+    report = {
+        "errors": len([i for i in issues if i["severity"] == "error"]),
+        "warnings": len([i for i in issues if i["severity"] == "warning"]),
+        "checksum": payload_checksum(p),
+    }
+    return issues, {"normalized": p, "report": report}
+
+
+@app.post('/api/v1/admin/curriculum/import-batches')
+def create_import_batch(payload: CurriculumImportBatchIn):
+    with get_conn() as conn:
+        source_hash = hashlib.sha256(json.dumps(payload.payload, sort_keys=True).encode()).hexdigest()
+        bid = conn.execute("INSERT INTO curriculum_import_batches (source_type,source_name,source_hash,imported_by_user_id,status,payload_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", (payload.source_type, payload.source_name, source_hash, payload.imported_by_user_id, "uploaded", json.dumps(payload.payload), utc_now(), utc_now())).lastrowid
+        return {"id": bid, "status": "uploaded"}
+
+
+@app.get('/api/v1/admin/curriculum/import-batches')
+def list_import_batches():
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM curriculum_import_batches ORDER BY id DESC").fetchall()]
+
+
+@app.get('/api/v1/admin/curriculum/import-batches/{batch_id}')
+def get_import_batch(batch_id: int):
+    with get_conn() as conn:
+        b = conn.execute("SELECT * FROM curriculum_import_batches WHERE id=?", (batch_id,)).fetchone()
+        if not b:
+            raise HTTPException(404, "batch não encontrado")
+        return dict(b)
+
+
+@app.post('/api/v1/admin/curriculum/import-batches/{batch_id}/validate')
+def validate_import_batch(batch_id: int):
+    with get_conn() as conn:
+        b = conn.execute("SELECT * FROM curriculum_import_batches WHERE id=?", (batch_id,)).fetchone()
+        if not b:
+            raise HTTPException(404, "batch não encontrado")
+        payload = json.loads(b["payload_json"])
+        issues, result = validate_curriculum(payload)
+        conn.execute("DELETE FROM curriculum_import_issues WHERE import_batch_id=?", (batch_id,))
+        for i in issues:
+            conn.execute("INSERT INTO curriculum_import_issues (import_batch_id,issue_type,severity,target_kind,target_ref,message,details_json,created_at) VALUES (?,?,?,?,?,?,?,?)", (batch_id, i["issue_type"], i["severity"], i["target_kind"], str(i["target_ref"]), i["message"], json.dumps(i["details_json"]), utc_now()))
+        status = "preview_ready" if result["report"]["errors"] == 0 else "failed"
+        conn.execute("UPDATE curriculum_import_batches SET status=?,preview_json=?,validation_report_json=?,updated_at=? WHERE id=?", (status, json.dumps(result["normalized"]), json.dumps(result["report"]), utc_now(), batch_id))
+        return {"batch_id": batch_id, "status": status, "report": result["report"]}
+
+
+@app.post('/api/v1/admin/curriculum/import-batches/{batch_id}/apply')
+def apply_import_batch(batch_id: int, applied_by_user_id: int = 0):
+    with get_conn() as conn:
+        b = conn.execute("SELECT * FROM curriculum_import_batches WHERE id=?", (batch_id,)).fetchone()
+        if not b:
+            raise HTTPException(404, "batch não encontrado")
+        if b["status"] != "preview_ready":
+            raise HTTPException(400, "batch não validado para apply")
+
+        preview = json.loads(b["preview_json"])
+        checksum = payload_checksum(preview)
+
+        existing = conn.execute("SELECT * FROM curriculum_versions WHERE checksum=?", (checksum,)).fetchone()
+        if existing:
+            conn.execute("UPDATE curriculum_import_batches SET status='applied',applied_at=?,updated_at=? WHERE id=?", (utc_now(), utc_now(), batch_id))
+            return {"status": "applied", "version_id": existing["id"], "idempotent": True}
+
+        col = preview["collection"]
+        conn.execute("INSERT OR REPLACE INTO collections (id,code,name,description,is_active,created_at,updated_at) VALUES ((SELECT id FROM collections WHERE code=?),?,?,?,?,?,?)", (col["code"], col["code"], col.get("name", col["code"]), col.get("description", ""), 1, utc_now(), utc_now()))
+        collection_id = conn.execute("SELECT id FROM collections WHERE code=?", (col["code"],)).fetchone()["id"]
+
+        track_ids = {}
+        for t in preview.get("tracks", []):
+            existing = conn.execute("SELECT id FROM tracks WHERE code=? AND collection_id=?", (t["code"], collection_id)).fetchone()
+            if existing:
+                conn.execute("UPDATE tracks SET name=?,description=?,canonical_order=?,status=?,is_active=1,updated_at=? WHERE id=?", (t.get("name", t["code"]), t.get("description", ""), t.get("canonical_order", 1), t.get("status", "active"), utc_now(), existing["id"]))
+                tid = existing["id"]
+            else:
+                tid = conn.execute("INSERT INTO tracks (collection_id,code,name,description,canonical_order,status,is_active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (collection_id, t["code"], t.get("name", t["code"]), t.get("description", ""), t.get("canonical_order", 1), t.get("status", "active"), 1, utc_now(), utc_now())).lastrowid
+            track_ids[t["code"]] = tid
+
+        volume_ids = {}
+        for v in preview.get("volumes", []):
+            tid = track_ids[v["track_code"]]
+            existing = conn.execute("SELECT id FROM volumes WHERE code=? AND track_id=?", (v["code"], tid)).fetchone()
+            if existing:
+                conn.execute("UPDATE volumes SET title=?,summary=?,canonical_order=?,status=?,source_master_ref=?,updated_at=? WHERE id=?", (v.get("title", v["code"]), v.get("summary", ""), v.get("canonical_order", 1), v.get("status", "authorized"), v.get("source_master_ref", "import"), utc_now(), existing["id"]))
+                vid = existing["id"]
+            else:
+                vid = conn.execute("INSERT INTO volumes (collection_id,track_id,code,title,summary,canonical_order,status,source_master_ref,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (collection_id, tid, v["code"], v.get("title", v["code"]), v.get("summary", ""), v.get("canonical_order", 1), v.get("status", "authorized"), v.get("source_master_ref", "import"), utc_now(), utc_now())).lastrowid
+            volume_ids[v["code"]] = vid
+
+        chapter_ids = {}
+        for c in preview.get("chapters", []):
+            vid = volume_ids[c["volume_code"]]
+            existing = conn.execute("SELECT id FROM chapters WHERE code=? AND volume_id=?", (c["code"], vid)).fetchone()
+            if existing:
+                conn.execute("UPDATE chapters SET title=?,summary=?,canonical_order=?,status=?,updated_at=? WHERE id=?", (c.get("title", c["code"]), c.get("summary", ""), c.get("canonical_order", 1), c.get("status", "authorized"), utc_now(), existing["id"]))
+                cid = existing["id"]
+            else:
+                cid = conn.execute("INSERT INTO chapters (volume_id,code,title,summary,canonical_order,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", (vid, c["code"], c.get("title", c["code"]), c.get("summary", ""), c.get("canonical_order", 1), c.get("status", "authorized"), utc_now(), utc_now())).lastrowid
+            chapter_ids[c["code"]] = cid
+
+        # archive old syllabi and insert new active
+        conn.execute("UPDATE syllabi SET status='archived',updated_at=?", (utc_now(),))
+        for s in preview.get("syllabi", []):
+            ch_id = chapter_ids[s["chapter_code"]]
+            vol_id = conn.execute("SELECT volume_id FROM chapters WHERE id=?", (ch_id,)).fetchone()["volume_id"]
+            track_id = conn.execute("SELECT track_id FROM volumes WHERE id=?", (vol_id,)).fetchone()["track_id"]
+            sc = hashlib.sha256(json.dumps(normalize_curriculum_payload(s), sort_keys=True).encode()).hexdigest()
+            conn.execute("INSERT INTO syllabi (collection_id,track_id,volume_id,chapter_id,version,status,title,objectives_json,program_content_json,notes_json,source_master_ref,checksum,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (collection_id, track_id, vol_id, ch_id, s.get("version", "1.0.0"), s.get("status", "active"), s.get("title", f"Ementa {s['chapter_code']}"), json.dumps(s.get("objectives", [])), json.dumps(s.get("program_content", [])), json.dumps(s.get("notes", [])), s.get("source_master_ref", "import"), sc, utc_now(), utc_now()))
+
+        version_id = conn.execute("INSERT INTO curriculum_versions (import_batch_id,collection_id,version_label,checksum,applied_by_user_id,created_at) VALUES (?,?,?,?,?,?)", (batch_id, collection_id, preview.get("version_label", f"batch-{batch_id}"), checksum, applied_by_user_id, utc_now())).lastrowid
+        conn.execute("UPDATE curriculum_import_batches SET status='applied',applied_at=?,updated_at=? WHERE id=?", (utc_now(), utc_now(), batch_id))
+        return {"status": "applied", "version_id": version_id, "idempotent": False}
+
+
+@app.get('/api/v1/admin/curriculum/import-batches/{batch_id}/issues')
+def get_import_issues(batch_id: int):
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM curriculum_import_issues WHERE import_batch_id=? ORDER BY id", (batch_id,)).fetchall()]
+
+
+@app.get('/api/v1/admin/curriculum/versions')
+def curriculum_versions_list():
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM curriculum_versions ORDER BY id DESC").fetchall()]
+
+
+@app.get('/api/v1/admin/curriculum/versions/{version_id}')
+def curriculum_version_detail(version_id: int):
+    with get_conn() as conn:
+        v = conn.execute("SELECT * FROM curriculum_versions WHERE id=?", (version_id,)).fetchone()
+        if not v:
+            raise HTTPException(404, "versão não encontrada")
+        return dict(v)
+
+
+@app.get('/api/v1/admin/curriculum/preview-diff')
+def curriculum_preview_diff(batch_id: int, against_version_id: int):
+    with get_conn() as conn:
+        b = conn.execute("SELECT * FROM curriculum_import_batches WHERE id=?", (batch_id,)).fetchone()
+        v = conn.execute("SELECT * FROM curriculum_versions WHERE id=?", (against_version_id,)).fetchone()
+        if not b or not v:
+            raise HTTPException(404, "batch/version não encontrado")
+        preview = b["preview_json"] or b["payload_json"]
+        diff = list(difflib.unified_diff((preview or "").splitlines(), [v["checksum"]], fromfile='preview', tofile='version_checksum', lineterm=''))
+        return {"summary": f"{len(diff)} linhas", "diff_text": "\n".join(diff)}

@@ -1,11 +1,9 @@
-# EIXO Formação / EIXO Trilhas — MVP + Fases 02/03/04
+# EIXO Formação / EIXO Trilhas — MVP + Fases 02/03/04/05
 
 Implementação operacional com:
-- árvore curricular + ementa vigente
-- geração por blocos com persistência e reuso
-- revisão/aprovação/rejeição/versionamento editorial
-- trilha adaptativa local e explicável (sem IA opaca)
-- retomada inteligente e recomendações discretas
+- geração + revisão + versionamento + jornada
+- importação canônica curricular com preview/validate/apply
+- validação estrutural, issues e versionamento da base
 
 ## Configuração
 ```bash
@@ -34,11 +32,16 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-## Endpoints de jornada (Fase 04)
-- `GET /api/v1/journey/me/next-step`
-- `GET /api/v1/journey/me/recommendations`
-- `GET /api/v1/journey/me/resume`
-- `POST /api/v1/journey/me/recommendations/{id}/dismiss`
+## Endpoints Fase 05 (importação canônica)
+- `POST /api/v1/admin/curriculum/import-batches`
+- `GET /api/v1/admin/curriculum/import-batches`
+- `GET /api/v1/admin/curriculum/import-batches/{batch_id}`
+- `POST /api/v1/admin/curriculum/import-batches/{batch_id}/validate`
+- `POST /api/v1/admin/curriculum/import-batches/{batch_id}/apply`
+- `GET /api/v1/admin/curriculum/import-batches/{batch_id}/issues`
+- `GET /api/v1/admin/curriculum/versions`
+- `GET /api/v1/admin/curriculum/versions/{version_id}`
+- `GET /api/v1/admin/curriculum/preview-diff?batch_id=<id>&against_version_id=<id>`
 
 ## Testes
 ```bash
