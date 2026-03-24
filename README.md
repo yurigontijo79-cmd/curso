@@ -1,9 +1,9 @@
-# EIXO Formação / EIXO Trilhas — MVP + Fases 02/03/04/05
+# EIXO Formação / EIXO Trilhas — MVP + Fases 02..06
 
 Implementação operacional com:
 - geração + revisão + versionamento + jornada
-- importação canônica curricular com preview/validate/apply
-- validação estrutural, issues e versionamento da base
+- importação canônica curricular (batch/validate/apply/version)
+- fila operacional de jobs, dedupe, claim/lock, retry e ações em lote
 
 ## Configuração
 ```bash
@@ -32,16 +32,18 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-## Endpoints Fase 05 (importação canônica)
-- `POST /api/v1/admin/curriculum/import-batches`
-- `GET /api/v1/admin/curriculum/import-batches`
-- `GET /api/v1/admin/curriculum/import-batches/{batch_id}`
-- `POST /api/v1/admin/curriculum/import-batches/{batch_id}/validate`
-- `POST /api/v1/admin/curriculum/import-batches/{batch_id}/apply`
-- `GET /api/v1/admin/curriculum/import-batches/{batch_id}/issues`
-- `GET /api/v1/admin/curriculum/versions`
-- `GET /api/v1/admin/curriculum/versions/{version_id}`
-- `GET /api/v1/admin/curriculum/preview-diff?batch_id=<id>&against_version_id=<id>`
+## Endpoints Fase 06 (fila e backlog)
+- `POST /api/v1/admin/jobs`
+- `GET /api/v1/admin/jobs`
+- `GET /api/v1/admin/jobs/{job_id}`
+- `POST /api/v1/admin/jobs/{job_id}/claim`
+- `POST /api/v1/admin/jobs/{job_id}/cancel`
+- `POST /api/v1/admin/jobs/{job_id}/retry`
+- `GET /api/v1/admin/jobs/{job_id}/logs`
+- `POST /api/v1/admin/batch-actions`
+- `GET /api/v1/admin/batch-actions`
+- `GET /api/v1/admin/backlog/summary`
+- `GET /api/v1/admin/backlog/review`
 
 ## Testes
 ```bash

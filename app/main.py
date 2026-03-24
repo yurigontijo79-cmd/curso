@@ -147,6 +147,50 @@ def init_db() -> None:
                 applied_by_user_id INTEGER,
                 created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS editorial_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_kind TEXT,
+                target_kind TEXT,
+                target_ref TEXT,
+                related_generation_request_id INTEGER,
+                related_generated_piece_id INTEGER,
+                created_by_user_id INTEGER,
+                assigned_to_user_id INTEGER,
+                priority TEXT,
+                status TEXT,
+                dedupe_key TEXT,
+                payload_json TEXT,
+                result_json TEXT,
+                failure_reason TEXT,
+                retry_count INTEGER,
+                max_retries INTEGER,
+                available_at TEXT,
+                locked_at TEXT,
+                completed_at TEXT,
+                cancelled_at TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS editorial_batch_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_kind TEXT,
+                created_by_user_id INTEGER,
+                status TEXT,
+                filters_json TEXT,
+                target_ids_json TEXT,
+                result_summary_json TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS job_execution_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                editorial_job_id INTEGER,
+                event_type TEXT,
+                message TEXT,
+                details_json TEXT,
+                created_at TEXT
+            );
             """
         )
 
@@ -410,46 +454,50 @@ def syllabus_c(chapter_id: int):
 
 
 # generation
+def _gen_request_with_conn(conn: sqlite3.Connection, payload: GenerationRequestIn):
+    settings = get_settings()
+    check_authorized(conn, payload.volume_id, payload.chapter_id)
+    s = get_current_syllabus(conn, payload.volume_id, payload.chapter_id)
+    if not s:
+        raise HTTPException(400, "Geração depende de ementa vigente válida")
+    c = conn.execute("SELECT * FROM collections WHERE id=?", (payload.collection_id,)).fetchone()
+    t = conn.execute("SELECT * FROM tracks WHERE id=?", (payload.track_id,)).fetchone()
+    volume_code = conn.execute("SELECT code FROM volumes WHERE id=?", (payload.volume_id,)).fetchone()["code"] if payload.volume_id else "-"
+    chapter_code = conn.execute("SELECT code FROM chapters WHERE id=?", (payload.chapter_id,)).fetchone()["code"] if payload.chapter_id else "-"
+    gk = deterministic_key(c["code"], t["code"], volume_code, chapter_code, payload.piece_kind, s["checksum"], payload.request_mode)
+
+    if payload.request_mode != 'force_new_version':
+        cands = conn.execute("SELECT gp.* FROM generated_pieces gp JOIN piece_reuse_index pri ON pri.generated_piece_id=gp.id WHERE pri.generation_key=? AND pri.is_active=1 AND gp.is_current=1 AND gp.status='ready'", (gk,)).fetchall()
+        if cands:
+            chosen = sorted(cands, key=lambda x: editorial_rank(x['review_state']), reverse=True)[0]
+            req_id = conn.execute("INSERT INTO generation_requests (user_id,collection_id,track_id,volume_id,chapter_id,piece_kind,request_mode,prompt_context_json,syllabus_id,syllabus_checksum,status,generation_key,execution_mode,provider_name,model_name,attempt_count,created_at,updated_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.user_id, payload.collection_id, payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind, payload.request_mode, json.dumps(payload.prompt_context_json), s['id'], s['checksum'], 'reused', gk, 'reused', chosen['generator_provider'], chosen['generator_model'], 0, utc_now(), utc_now(), utc_now())).lastrowid
+            return {'request_id': req_id, 'status': 'reused', 'generated_piece': dict(chosen)}
+
+    req_id = conn.execute("INSERT INTO generation_requests (user_id,collection_id,track_id,volume_id,chapter_id,piece_kind,request_mode,prompt_context_json,syllabus_id,syllabus_checksum,status,generation_key,execution_mode,attempt_count,started_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.user_id, payload.collection_id, payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind, payload.request_mode, json.dumps(payload.prompt_context_json), s['id'], s['checksum'], 'processing', gk, settings.generation_mode, 0, utc_now(), utc_now(), utc_now())).lastrowid
+    try:
+        blocks = [b.__dict__ for b in get_engine(settings).generate_piece({"program_content": ["pc"], "blocks": generation_blocks(), "target": {}, "syllabus": {}, "style_rules": [], "forbidden": []})]
+        title = f"{payload.piece_kind.upper()} {volume_code}/{chapter_code}"
+        content = stitch_blocks(blocks, title)
+        previous = conn.execute("SELECT * FROM generated_pieces WHERE track_id=? AND IFNULL(volume_id,-1)=IFNULL(?,-1) AND IFNULL(chapter_id,-1)=IFNULL(?,-1) AND piece_kind=? AND syllabus_checksum=? AND is_current=1 ORDER BY id DESC LIMIT 1", (payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind, s['checksum'])).fetchone()
+        version = conn.execute("SELECT COALESCE(MAX(version),0) v FROM generated_pieces WHERE track_id=? AND IFNULL(volume_id,-1)=IFNULL(?,-1) AND IFNULL(chapter_id,-1)=IFNULL(?,-1) AND piece_kind=?", (payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind)).fetchone()['v'] + 1
+        pid = conn.execute("INSERT INTO generated_pieces (collection_id,track_id,volume_id,chapter_id,syllabus_id,syllabus_checksum,piece_kind,title,version,status,review_state,is_current,generation_request_id,content_markdown,content_plaintext,storage_path,origin,created_by_user_id,generator_provider,generator_model,generation_trace_json,source_request_payload_json,content_hash,supersedes_piece_id,created_at,updated_at,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.collection_id, payload.track_id, payload.volume_id, payload.chapter_id, s['id'], s['checksum'], payload.piece_kind, title, version, 'ready', 'raw', 1, req_id, content, content, f"storage/generated/{req_id}.md", 'generated', payload.user_id, 'mock', 'mock-v1', json.dumps({'blocks': blocks}), json.dumps(payload.prompt_context_json), hashlib.sha256(content.encode()).hexdigest(), previous['id'] if previous else None, utc_now(), utc_now(), utc_now())).lastrowid
+        if previous:
+            conn.execute("UPDATE generated_pieces SET is_current=0,superseded_by_piece_id=?,updated_at=? WHERE id=?", (pid, utc_now(), previous['id']))
+        conn.execute("INSERT OR REPLACE INTO piece_reuse_index (generation_key,generated_piece_id,is_active,created_at,updated_at) VALUES (?,?,?,?,?)", (gk, pid, 1, utc_now(), utc_now()))
+        conn.execute("UPDATE generation_requests SET status='completed',execution_mode=?,provider_name=?,model_name=?,attempt_count=attempt_count+1,updated_at=?,completed_at=? WHERE id=?", (settings.generation_mode, 'mock', 'mock-v1', utc_now(), utc_now(), req_id))
+        return {'request_id': req_id, 'status': 'completed', 'generated_piece': dict(conn.execute("SELECT * FROM generated_pieces WHERE id=?", (pid,)).fetchone())}
+    except Exception as exc:
+        conn.execute("UPDATE generation_requests SET status='failed',failure_reason=?,attempt_count=attempt_count+1,updated_at=? WHERE id=?", (str(exc), utc_now(), req_id))
+        conn.commit()
+        if settings.generation_mode == 'real_llm' and not settings.allow_mock_fallback:
+            raise HTTPException(502, f"Falha real de geração: {exc}")
+        raise HTTPException(500, str(exc))
+
+
 @app.post('/api/v1/generation/requests')
 def gen_request(payload: GenerationRequestIn):
-    settings = get_settings()
     with get_conn() as conn:
-        check_authorized(conn, payload.volume_id, payload.chapter_id)
-        s = get_current_syllabus(conn, payload.volume_id, payload.chapter_id)
-        if not s:
-            raise HTTPException(400, "Geração depende de ementa vigente válida")
-        c = conn.execute("SELECT * FROM collections WHERE id=?", (payload.collection_id,)).fetchone()
-        t = conn.execute("SELECT * FROM tracks WHERE id=?", (payload.track_id,)).fetchone()
-        volume_code = conn.execute("SELECT code FROM volumes WHERE id=?", (payload.volume_id,)).fetchone()["code"] if payload.volume_id else "-"
-        chapter_code = conn.execute("SELECT code FROM chapters WHERE id=?", (payload.chapter_id,)).fetchone()["code"] if payload.chapter_id else "-"
-        gk = deterministic_key(c["code"], t["code"], volume_code, chapter_code, payload.piece_kind, s["checksum"], payload.request_mode)
-
-        if payload.request_mode != 'force_new_version':
-            cands = conn.execute("SELECT gp.* FROM generated_pieces gp JOIN piece_reuse_index pri ON pri.generated_piece_id=gp.id WHERE pri.generation_key=? AND pri.is_active=1 AND gp.is_current=1 AND gp.status='ready'", (gk,)).fetchall()
-            if cands:
-                chosen = sorted(cands, key=lambda x: editorial_rank(x['review_state']), reverse=True)[0]
-                req_id = conn.execute("INSERT INTO generation_requests (user_id,collection_id,track_id,volume_id,chapter_id,piece_kind,request_mode,prompt_context_json,syllabus_id,syllabus_checksum,status,generation_key,execution_mode,provider_name,model_name,attempt_count,created_at,updated_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.user_id, payload.collection_id, payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind, payload.request_mode, json.dumps(payload.prompt_context_json), s['id'], s['checksum'], 'reused', gk, 'reused', chosen['generator_provider'], chosen['generator_model'], 0, utc_now(), utc_now(), utc_now())).lastrowid
-                return {'request_id': req_id, 'status': 'reused', 'generated_piece': dict(chosen)}
-
-        req_id = conn.execute("INSERT INTO generation_requests (user_id,collection_id,track_id,volume_id,chapter_id,piece_kind,request_mode,prompt_context_json,syllabus_id,syllabus_checksum,status,generation_key,execution_mode,attempt_count,started_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.user_id, payload.collection_id, payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind, payload.request_mode, json.dumps(payload.prompt_context_json), s['id'], s['checksum'], 'processing', gk, settings.generation_mode, 0, utc_now(), utc_now(), utc_now())).lastrowid
-        try:
-            blocks = [b.__dict__ for b in get_engine(settings).generate_piece({"program_content": ["pc"], "blocks": generation_blocks(), "target": {}, "syllabus": {}, "style_rules": [], "forbidden": []})]
-            title = f"{payload.piece_kind.upper()} {volume_code}/{chapter_code}"
-            content = stitch_blocks(blocks, title)
-            previous = conn.execute("SELECT * FROM generated_pieces WHERE track_id=? AND IFNULL(volume_id,-1)=IFNULL(?,-1) AND IFNULL(chapter_id,-1)=IFNULL(?,-1) AND piece_kind=? AND syllabus_checksum=? AND is_current=1 ORDER BY id DESC LIMIT 1", (payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind, s['checksum'])).fetchone()
-            version = conn.execute("SELECT COALESCE(MAX(version),0) v FROM generated_pieces WHERE track_id=? AND IFNULL(volume_id,-1)=IFNULL(?,-1) AND IFNULL(chapter_id,-1)=IFNULL(?,-1) AND piece_kind=?", (payload.track_id, payload.volume_id, payload.chapter_id, payload.piece_kind)).fetchone()['v'] + 1
-            pid = conn.execute("INSERT INTO generated_pieces (collection_id,track_id,volume_id,chapter_id,syllabus_id,syllabus_checksum,piece_kind,title,version,status,review_state,is_current,generation_request_id,content_markdown,content_plaintext,storage_path,origin,created_by_user_id,generator_provider,generator_model,generation_trace_json,source_request_payload_json,content_hash,supersedes_piece_id,created_at,updated_at,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.collection_id, payload.track_id, payload.volume_id, payload.chapter_id, s['id'], s['checksum'], payload.piece_kind, title, version, 'ready', 'raw', 1, req_id, content, content, f"storage/generated/{req_id}.md", 'generated', payload.user_id, 'mock', 'mock-v1', json.dumps({'blocks': blocks}), json.dumps(payload.prompt_context_json), hashlib.sha256(content.encode()).hexdigest(), previous['id'] if previous else None, utc_now(), utc_now(), utc_now())).lastrowid
-            if previous:
-                conn.execute("UPDATE generated_pieces SET is_current=0,superseded_by_piece_id=?,updated_at=? WHERE id=?", (pid, utc_now(), previous['id']))
-            conn.execute("INSERT OR REPLACE INTO piece_reuse_index (generation_key,generated_piece_id,is_active,created_at,updated_at) VALUES (?,?,?,?,?)", (gk, pid, 1, utc_now(), utc_now()))
-            conn.execute("UPDATE generation_requests SET status='completed',execution_mode=?,provider_name=?,model_name=?,attempt_count=attempt_count+1,updated_at=?,completed_at=? WHERE id=?", (settings.generation_mode, 'mock', 'mock-v1', utc_now(), utc_now(), req_id))
-            return {'request_id': req_id, 'status': 'completed', 'generated_piece': dict(conn.execute("SELECT * FROM generated_pieces WHERE id=?", (pid,)).fetchone())}
-        except Exception as exc:
-            conn.execute("UPDATE generation_requests SET status='failed',failure_reason=?,attempt_count=attempt_count+1,updated_at=? WHERE id=?", (str(exc), utc_now(), req_id))
-            conn.commit()
-            if settings.generation_mode == 'real_llm' and not settings.allow_mock_fallback:
-                raise HTTPException(502, f"Falha real de geração: {exc}")
-            raise HTTPException(500, str(exc))
+        return _gen_request_with_conn(conn, payload)
 
 
 @app.get('/api/v1/generation/requests/{request_id}')
@@ -1007,3 +1055,240 @@ def curriculum_preview_diff(batch_id: int, against_version_id: int):
         preview = b["preview_json"] or b["payload_json"]
         diff = list(difflib.unified_diff((preview or "").splitlines(), [v["checksum"]], fromfile='preview', tofile='version_checksum', lineterm=''))
         return {"summary": f"{len(diff)} linhas", "diff_text": "\n".join(diff)}
+
+class EditorialJobIn(BaseModel):
+    job_kind: str
+    target_kind: str
+    target_ref: str
+    created_by_user_id: int | None = None
+    priority: str = "normal"
+    payload_json: dict[str, Any] = {}
+    max_retries: int = 2
+
+
+class EditorialBatchActionIn(BaseModel):
+    action_kind: str
+    created_by_user_id: int
+    filters_json: dict[str, Any] = {}
+    target_ids_json: list[int] = []
+
+
+def _log_job(conn: sqlite3.Connection, job_id: int, event: str, message: str, details: dict[str, Any] | None = None) -> None:
+    conn.execute("INSERT INTO job_execution_logs (editorial_job_id,event_type,message,details_json,created_at) VALUES (?,?,?,?,?)", (job_id, event, message, json.dumps(details or {}), utc_now()))
+
+
+def _dedupe_key(job_kind: str, target_kind: str, target_ref: str, payload_json: dict[str, Any]) -> str:
+    if job_kind == 'generate_piece' and payload_json.get('generation_key'):
+        return f"generate_piece::{payload_json['generation_key']}"
+    if job_kind == 'review_piece':
+        return f"review_piece::{target_ref}"
+    if job_kind == 'curriculum_apply':
+        return f"curriculum_apply::{target_ref}"
+    return f"{job_kind}::{target_kind}::{target_ref}"
+
+
+def _execute_job(conn: sqlite3.Connection, job: sqlite3.Row) -> tuple[str, dict[str, Any], str | None]:
+    kind = job['job_kind']
+    payload = json.loads(job['payload_json'] or '{}')
+    try:
+        if kind == 'generate_piece':
+            res = _gen_request_with_conn(conn, GenerationRequestIn(**payload))
+            return 'completed', {'generation': res}, None
+        if kind == 'review_piece':
+            piece_id = int(job['target_ref'])
+            piece = conn.execute("SELECT * FROM generated_pieces WHERE id=?", (piece_id,)).fetchone()
+            if not piece:
+                return 'failed', {}, 'piece inexistente'
+            if piece['review_state'] not in ['raw', 'reviewed']:
+                return 'blocked', {}, 'estado editorial não elegível para review queue'
+            r = review(piece_id, ReviewIn(decided_by_user_id=payload.get('decided_by_user_id', 0), decision_type=payload.get('decision_type', 'mark_reviewed'), decision_notes=payload.get('decision_notes', 'queue review')))
+            return 'completed', {'review': r}, None
+        if kind == 'promote_current':
+            r = promote(int(job['target_ref']))
+            return 'completed', {'promote': r}, None
+        if kind == 'archive_piece':
+            r = archive(int(job['target_ref']))
+            return 'completed', {'archive': r}, None
+        if kind == 'recompute_recommendations':
+            recs = journey_recs(int(job['target_ref']))
+            return 'completed', {'recommendations': recs}, None
+        if kind == 'curriculum_apply':
+            r = apply_import_batch(int(job['target_ref']), payload.get('applied_by_user_id', 0))
+            return 'completed', {'apply': r}, None
+        return 'failed', {}, 'job_kind não suportado'
+    except Exception as exc:
+        return 'failed', {}, str(exc)
+
+
+def _create_job_with_conn(conn: sqlite3.Connection, payload: EditorialJobIn):
+    if payload.job_kind not in ['generate_piece','review_piece','request_revision','reprocess_piece','promote_current','archive_piece','curriculum_apply','recompute_recommendations']:
+        raise HTTPException(400, 'job_kind inválido')
+    if payload.priority not in ['low','normal','high','urgent']:
+        raise HTTPException(400, 'priority inválida')
+    dedupe = _dedupe_key(payload.job_kind, payload.target_kind, payload.target_ref, payload.payload_json)
+    existing = conn.execute("SELECT * FROM editorial_jobs WHERE dedupe_key=? AND status IN ('queued','claimed','processing')", (dedupe,)).fetchone()
+    if existing:
+        _log_job(conn, existing['id'], 'deduplicated', 'job equivalente já ativo', {'dedupe_key': dedupe})
+        return {'id': existing['id'], 'status': existing['status'], 'deduplicated': True}
+    jid = conn.execute("INSERT INTO editorial_jobs (job_kind,target_kind,target_ref,created_by_user_id,priority,status,dedupe_key,payload_json,retry_count,max_retries,available_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload.job_kind, payload.target_kind, payload.target_ref, payload.created_by_user_id, payload.priority, 'queued', dedupe, json.dumps(payload.payload_json), 0, payload.max_retries, utc_now(), utc_now(), utc_now())).lastrowid
+    _log_job(conn, jid, 'queued', 'job enfileirado', {'priority': payload.priority})
+    return {'id': jid, 'status': 'queued', 'deduplicated': False}
+
+
+@app.post('/api/v1/admin/jobs')
+def create_job(payload: EditorialJobIn):
+    with get_conn() as conn:
+        return _create_job_with_conn(conn, payload)
+
+
+@app.get('/api/v1/admin/jobs')
+def list_jobs(job_kind: str | None = None, status: str | None = None, priority: str | None = None, target_kind: str | None = None, assigned_to_user_id: int | None = None, created_by_user_id: int | None = None):
+    with get_conn() as conn:
+        q = "SELECT * FROM editorial_jobs WHERE 1=1"
+        args=[]
+        for field,val in [('job_kind',job_kind),('status',status),('priority',priority),('target_kind',target_kind),('assigned_to_user_id',assigned_to_user_id),('created_by_user_id',created_by_user_id)]:
+            if val is not None:
+                q += f" AND {field}=?"; args.append(val)
+        return [dict(r) for r in conn.execute(q + " ORDER BY created_at", tuple(args)).fetchall()]
+
+
+@app.get('/api/v1/admin/jobs/{job_id}')
+def get_job(job_id: int):
+    with get_conn() as conn:
+        j = conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone()
+        if not j:
+            raise HTTPException(404, 'job não encontrado')
+        return dict(j)
+
+
+@app.post('/api/v1/admin/jobs/{job_id}/claim')
+def claim_job(job_id: int, assigned_to_user_id: int = 0, process: bool = True):
+    with get_conn() as conn:
+        j = conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone()
+        if not j:
+            raise HTTPException(404, 'job não encontrado')
+        if j['status'] in ['completed','cancelled']:
+            raise HTTPException(400, 'job não elegível para claim')
+        if j['locked_at'] and j['status'] in ['claimed','processing']:
+            raise HTTPException(400, 'job já locked')
+        conn.execute("UPDATE editorial_jobs SET status='claimed',assigned_to_user_id=?,locked_at=?,updated_at=? WHERE id=?", (assigned_to_user_id, utc_now(), utc_now(), job_id))
+        _log_job(conn, job_id, 'claimed', 'job claimado', {'assigned_to': assigned_to_user_id})
+        if process:
+            j = conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone()
+            conn.execute("UPDATE editorial_jobs SET status='processing',updated_at=? WHERE id=?", (utc_now(), job_id))
+            _log_job(conn, job_id, 'started', 'execução iniciada', {})
+            status, result, failure = _execute_job(conn, j)
+            if status == 'completed':
+                conn.execute("UPDATE editorial_jobs SET status='completed',result_json=?,completed_at=?,updated_at=? WHERE id=?", (json.dumps(result), utc_now(), utc_now(), job_id))
+                _log_job(conn, job_id, 'completed', 'execução concluída', result)
+            elif status == 'blocked':
+                conn.execute("UPDATE editorial_jobs SET status='blocked',failure_reason=?,updated_at=? WHERE id=?", (failure, utc_now(), job_id))
+                _log_job(conn, job_id, 'failed', 'job bloqueado', {'reason': failure})
+            else:
+                conn.execute("UPDATE editorial_jobs SET status='failed',failure_reason=?,retry_count=retry_count+1,updated_at=? WHERE id=?", (failure, utc_now(), job_id))
+                _log_job(conn, job_id, 'failed', 'execução falhou', {'reason': failure})
+        return dict(conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone())
+
+
+@app.post('/api/v1/admin/jobs/{job_id}/cancel')
+def cancel_job(job_id: int):
+    with get_conn() as conn:
+        j = conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone()
+        if not j:
+            raise HTTPException(404, 'job não encontrado')
+        if j['status'] != 'queued':
+            raise HTTPException(400, 'cancel permitido apenas para jobs em fila')
+        conn.execute("UPDATE editorial_jobs SET status='cancelled',cancelled_at=?,updated_at=? WHERE id=?", (utc_now(), utc_now(), job_id))
+        _log_job(conn, job_id, 'cancelled', 'job cancelado', {})
+        return {'status':'cancelled'}
+
+
+@app.post('/api/v1/admin/jobs/{job_id}/retry')
+def retry_job(job_id: int):
+    with get_conn() as conn:
+        j = conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone()
+        if not j:
+            raise HTTPException(404, 'job não encontrado')
+        if j['status'] == 'completed':
+            raise HTTPException(400, 'retry inválido para completed')
+        if j['retry_count'] >= j['max_retries']:
+            raise HTTPException(400, 'max retries atingido')
+        conn.execute("UPDATE editorial_jobs SET status='queued',locked_at=NULL,failure_reason=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
+        _log_job(conn, job_id, 'retried', 'job reenfileirado', {'retry_count': j['retry_count'] + 1})
+        return dict(conn.execute("SELECT * FROM editorial_jobs WHERE id=?", (job_id,)).fetchone())
+
+
+@app.get('/api/v1/admin/jobs/{job_id}/logs')
+def job_logs(job_id: int):
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM job_execution_logs WHERE editorial_job_id=? ORDER BY id", (job_id,)).fetchall()]
+
+
+@app.post('/api/v1/admin/batch-actions')
+def create_batch_action(payload: EditorialBatchActionIn):
+    with get_conn() as conn:
+        if not payload.filters_json and not payload.target_ids_json:
+            raise HTTPException(400, 'batch action sem alvo material')
+        bid = conn.execute("INSERT INTO editorial_batch_actions (action_kind,created_by_user_id,status,filters_json,target_ids_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (payload.action_kind, payload.created_by_user_id, 'processing', json.dumps(payload.filters_json), json.dumps(payload.target_ids_json), utc_now(), utc_now())).lastrowid
+        created = 0
+        if payload.action_kind == 'queue_generate_for_volume':
+            volume_id = payload.filters_json.get('volume_id')
+            chapters = conn.execute("SELECT * FROM chapters WHERE volume_id=? AND status='authorized'", (volume_id,)).fetchall()
+            for c in chapters:
+                vol = conn.execute("SELECT * FROM volumes WHERE id=?", (volume_id,)).fetchone()
+                tr = conn.execute("SELECT * FROM tracks WHERE id=?", (vol['track_id'],)).fetchone()
+                col = conn.execute("SELECT * FROM collections WHERE id=?", (vol['collection_id'],)).fetchone()
+                res = _create_job_with_conn(conn, EditorialJobIn(job_kind='generate_piece', target_kind='chapter', target_ref=str(c['id']), created_by_user_id=payload.created_by_user_id, payload_json={'user_id': payload.created_by_user_id or 0, 'collection_id': col['id'], 'track_id': tr['id'], 'volume_id': vol['id'], 'chapter_id': c['id'], 'piece_kind': 'chapter', 'request_mode': 'create_if_missing', 'prompt_context_json': {}}))
+                if not res.get('deduplicated'):
+                    created += 1
+        elif payload.action_kind == 'queue_review_for_track':
+            track_id = payload.filters_json.get('track_id')
+            pieces = conn.execute("SELECT * FROM generated_pieces WHERE track_id=? AND review_state='raw' AND status='ready'", (track_id,)).fetchall()
+            for p in pieces:
+                res = _create_job_with_conn(conn, EditorialJobIn(job_kind='review_piece', target_kind='piece', target_ref=str(p['id']), created_by_user_id=payload.created_by_user_id, payload_json={'decision_type': 'mark_reviewed', 'decided_by_user_id': payload.created_by_user_id or 0}))
+                if not res.get('deduplicated'):
+                    created += 1
+        elif payload.action_kind == 'retry_failed_jobs':
+            jobs = conn.execute("SELECT * FROM editorial_jobs WHERE status='failed'").fetchall()
+            for j in jobs:
+                try:
+                    retry_job(j['id']); created += 1
+                except Exception:
+                    pass
+        else:
+            raise HTTPException(400, 'action_kind não suportado')
+        conn.execute("UPDATE editorial_batch_actions SET status='completed',result_summary_json=?,completed_at=?,updated_at=? WHERE id=?", (json.dumps({'jobs_created_or_updated': created}), utc_now(), utc_now(), bid))
+        return {'id': bid, 'status': 'completed', 'jobs_created_or_updated': created}
+
+
+@app.get('/api/v1/admin/batch-actions')
+def list_batch_actions():
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM editorial_batch_actions ORDER BY id DESC").fetchall()]
+
+
+@app.get('/api/v1/admin/backlog/summary')
+def backlog_summary():
+    with get_conn() as conn:
+        def cnt(where):
+            return conn.execute(f"SELECT COUNT(*) c FROM editorial_jobs WHERE {where}").fetchone()['c']
+        return {
+            'queued_count': cnt("status='queued'"),
+            'processing_count': cnt("status IN ('claimed','processing')"),
+            'failed_count': cnt("status='failed'"),
+            'blocked_count': cnt("status='blocked'"),
+            'review_pending_count': conn.execute("SELECT COUNT(*) c FROM generated_pieces WHERE review_state='raw' AND status='ready'").fetchone()['c'],
+            'urgent_count': cnt("priority='urgent' AND status IN ('queued','claimed','processing')"),
+            'completed_last_24h': conn.execute("SELECT COUNT(*) c FROM editorial_jobs WHERE status='completed' AND completed_at>=?", ((datetime.now(timezone.utc)-timedelta(hours=24)).isoformat(),)).fetchone()['c'],
+        }
+
+
+@app.get('/api/v1/admin/backlog/review')
+def backlog_review(track_id: int | None = None):
+    with get_conn() as conn:
+        q = "SELECT * FROM generated_pieces WHERE review_state='raw' AND status='ready'"
+        args=[]
+        if track_id is not None:
+            q += " AND track_id=?"; args.append(track_id)
+        q += " ORDER BY created_at"
+        return [dict(r) for r in conn.execute(q, tuple(args)).fetchall()]
